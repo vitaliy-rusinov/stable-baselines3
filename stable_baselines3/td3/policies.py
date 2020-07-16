@@ -1,12 +1,18 @@
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Optional, List, Callable, Union, Type, Any, Dict
 
 import gym
 import torch as th
-from torch import nn as nn
+import torch.nn as nn
 
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, register_policy
+import torch_geometric
+
 from stable_baselines3.common.preprocessing import get_action_dim
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, FlattenExtractor, NatureCNN, create_mlp
+from stable_baselines3.common.policies import BasePolicy, register_policy, ContinuousCritic
+from stable_baselines3.common.torch_layers import create_mlp, NatureCNN, BaseFeaturesExtractor, FlattenExtractor
+
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
+
+from project_code.graph_constructor import graph_plugin
 
 
 class Actor(BasePolicy):
@@ -25,25 +31,20 @@ class Actor(BasePolicy):
     :param device: (Union[th.device, str]) Device on which the code should run.
     """
 
-    def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        net_arch: List[int],
-        features_extractor: nn.Module,
-        features_dim: int,
-        activation_fn: Type[nn.Module] = nn.ReLU,
-        normalize_images: bool = True,
-        device: Union[th.device, str] = "auto",
-    ):
-        super(Actor, self).__init__(
-            observation_space,
-            action_space,
-            features_extractor=features_extractor,
-            normalize_images=normalize_images,
-            device=device,
-            squash_output=True,
-        )
+    def __init__(self,
+                 observation_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space,
+                 net_arch: List[int],
+                 features_extractor: nn.Module,
+                 features_dim: int,
+                 activation_fn: Type[nn.Module] = nn.ReLU,
+                 normalize_images: bool = True,
+                 device: Union[th.device, str] = 'auto'):
+        super(Actor, self).__init__(observation_space, action_space,
+                                    features_extractor=features_extractor,
+                                    normalize_images=normalize_images,
+                                    device=device,
+                                    squash_output=True)
 
         self.features_extractor = features_extractor
         self.normalize_images = normalize_images
@@ -59,20 +60,112 @@ class Actor(BasePolicy):
     def _get_data(self) -> Dict[str, Any]:
         data = super()._get_data()
 
-        data.update(
-            dict(
-                net_arch=self.net_arch,
-                features_dim=self.features_dim,
-                activation_fn=self.activation_fn,
-                features_extractor=self.features_extractor,
-            )
-        )
+        data.update(dict(
+            net_arch=self.net_arch,
+            features_dim=self.features_dim,
+            activation_fn=self.activation_fn,
+            features_extractor=self.features_extractor
+        ))
         return data
 
     def forward(self, obs: th.Tensor, deterministic: bool = True) -> th.Tensor:
         # assert deterministic, 'The TD3 actor only outputs deterministic actions'
         features = self.extract_features(obs)
         return self.mu(features)
+
+    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        return self.forward(observation, deterministic=deterministic)
+
+class GNNActor(BasePolicy):
+    """
+    Actor network (policy) for TD3.
+
+    :param observation_space: (gym.spaces.Space) Obervation space
+    :param action_space: (gym.spaces.Space) Action space
+    :param net_arch: ([int]) Network architecture
+    :param features_extractor: (nn.Module) Network to extract features
+        (a CNN when using images, a nn.Flatten() layer otherwise)
+    :param features_dim: (int) Number of features
+    :param activation_fn: (Type[nn.Module]) Activation function
+    :param normalize_images: (bool) Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param device: (Union[th.device, str]) Device on which the code should run.
+    """
+
+    def __init__(self,
+                 observation_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space,
+                 net_arch: List[int],
+                 features_extractor: nn.Module,
+                 features_dim: int,
+                 activation_fn: Type[nn.Module] = nn.ReLU,
+                 normalize_images: bool = True,
+                 device: Union[th.device, str] = 'auto', robot_params: List[str]=None):
+        super(GNNActor, self).__init__(observation_space, action_space,
+                                    features_extractor=features_extractor,
+                                    normalize_images=normalize_images,
+                                    device=device,
+                                    squash_output=True)
+
+        self.features_extractor = features_extractor
+        self.normalize_images = normalize_images
+        self.net_arch = net_arch
+        self.features_dim = features_dim
+        self.activation_fn = activation_fn
+
+
+        self.robot_graph=graph_plugin.RobotGraphCreator(*robot_params, action_space.shape[0], observation_space.shape[0]).getGraph()
+        self.node_feature_num = self.robot_graph.get_num_features_per_joint()
+
+
+
+        action_dim = get_action_dim(self.action_space)
+
+        net_features_dim=self.robot_graph.get_nonjoint_features_num()+256
+
+        #actor_net = create_mlp(net_features_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        # Deterministic action
+        #self.mu = nn.Sequential(*actor_net)
+
+        self.conv1=torch_geometric.nn.GCNConv(self.node_feature_num, 256)
+        self.conv2 = torch_geometric.nn.GCNConv(256, 256)
+        self.conv3 = torch_geometric.nn.GCNConv(256, 256)
+        self.conv4 = torch_geometric.nn.GCNConv(256, 256)
+
+        self.lin1 = th.nn.Linear(256,1)
+
+    def _get_data(self) -> Dict[str, Any]:
+        data = super()._get_data()
+
+        data.update(dict(
+            net_arch=self.net_arch,
+            features_dim=self.features_dim,
+            activation_fn=self.activation_fn,
+            features_extractor=self.features_extractor
+        ))
+        return data
+
+    def forward(self, obs: th.Tensor, deterministic: bool = True) -> th.Tensor:
+        # assert deterministic, 'The TD3 actor only outputs deterministic actions'
+        features = self.extract_features(obs)
+
+        torch_geom_node_features, torch_geom_edge_index=graph_plugin.initialize_features_2_per_node(self.robot_graph,obs,False)
+        batch_size = obs.shape[0]
+
+        q = self.conv1(torch_geom_node_features, torch_geom_edge_index)
+        q = th.nn.functional.relu(q)
+        q = self.conv2(q, torch_geom_edge_index)
+        q = th.nn.functional.relu(q)
+        q = self.conv3(q, torch_geom_edge_index)
+        q = th.nn.functional.relu(q)
+        q = self.conv4(q, torch_geom_edge_index)
+        q = th.nn.functional.relu(q)
+        gnn_output = q.reshape((batch_size, int(torch_geom_node_features.shape[0]/batch_size),-1))
+        gnn_output=gnn_output[:,1:,:]#.mean(-1)
+        output=self.lin1(gnn_output)
+
+        return output.reshape(batch_size,-1)
+        #return self.mu(features)
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
         return self.forward(observation, deterministic=deterministic)
@@ -100,31 +193,25 @@ class TD3Policy(BasePolicy):
     :param n_critics: (int) Number of critic networks to create.
     """
 
-    def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        lr_schedule: Callable,
-        net_arch: Optional[List[int]] = None,
-        device: Union[th.device, str] = "auto",
-        activation_fn: Type[nn.Module] = nn.ReLU,
-        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        n_critics: int = 2,
-    ):
-        super(TD3Policy, self).__init__(
-            observation_space,
-            action_space,
-            device,
-            features_extractor_class,
-            features_extractor_kwargs,
-            optimizer_class=optimizer_class,
-            optimizer_kwargs=optimizer_kwargs,
-            squash_output=True,
-        )
+    def __init__(self, observation_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space,
+                 lr_schedule: Callable,
+                 net_arch: Optional[List[int]] = None,
+                 device: Union[th.device, str] = 'auto',
+                 activation_fn: Type[nn.Module] = nn.ReLU,
+                 features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+                 features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+                 normalize_images: bool = True,
+                 optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+                 optimizer_kwargs: Optional[Dict[str, Any]] = None,
+                 n_critics: int = 2):
+        super(TD3Policy, self).__init__(observation_space, action_space,
+                                        device,
+                                        features_extractor_class,
+                                        features_extractor_kwargs,
+                                        optimizer_class=optimizer_class,
+                                        optimizer_kwargs=optimizer_kwargs,
+                                        squash_output=True)
 
         # Default network architecture, from the original paper
         if net_arch is None:
@@ -133,23 +220,24 @@ class TD3Policy(BasePolicy):
             else:
                 net_arch = []
 
-        self.features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
+        self.features_extractor = features_extractor_class(self.observation_space,
+                                                           **self.features_extractor_kwargs)
         self.features_dim = self.features_extractor.features_dim
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.net_args = {
-            "observation_space": self.observation_space,
-            "action_space": self.action_space,
-            "features_extractor": self.features_extractor,
-            "features_dim": self.features_dim,
-            "net_arch": self.net_arch,
-            "activation_fn": self.activation_fn,
-            "normalize_images": normalize_images,
-            "device": device,
+            'observation_space': self.observation_space,
+            'action_space': self.action_space,
+            'features_extractor': self.features_extractor,
+            'features_dim': self.features_dim,
+            'net_arch': self.net_arch,
+            'activation_fn': self.activation_fn,
+            'normalize_images': normalize_images,
+            'device': device
         }
         self.critic_kwargs = self.net_args.copy()
-        self.critic_kwargs.update({"n_critics": n_critics})
+        self.critic_kwargs.update({'n_critics': n_critics})
         self.actor, self.actor_target = None, None
         self.critic, self.critic_target = None, None
 
@@ -159,27 +247,27 @@ class TD3Policy(BasePolicy):
         self.actor = self.make_actor()
         self.actor_target = self.make_actor()
         self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=lr_schedule(1),
+                                                    **self.optimizer_kwargs)
         self.critic = self.make_critic()
         self.critic_target = self.make_critic()
         self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=lr_schedule(1),
+                                                     **self.optimizer_kwargs)
 
     def _get_data(self) -> Dict[str, Any]:
         data = super()._get_data()
 
-        data.update(
-            dict(
-                net_arch=self.net_args["net_arch"],
-                activation_fn=self.net_args["activation_fn"],
-                n_critics=self.critic_kwargs["n_critics"],
-                lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
-                optimizer_class=self.optimizer_class,
-                optimizer_kwargs=self.optimizer_kwargs,
-                features_extractor_class=self.features_extractor_class,
-                features_extractor_kwargs=self.features_extractor_kwargs,
-            )
-        )
+        data.update(dict(
+            net_arch=self.net_args['net_arch'],
+            activation_fn=self.net_args['activation_fn'],
+            n_critics=self.critic_kwargs['n_critics'],
+            lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+            optimizer_class=self.optimizer_class,
+            optimizer_kwargs=self.optimizer_kwargs,
+            features_extractor_class=self.features_extractor_class,
+            features_extractor_kwargs=self.features_extractor_kwargs
+        ))
         return data
 
     def make_actor(self) -> Actor:
@@ -220,36 +308,84 @@ class CnnPolicy(TD3Policy):
     :param n_critics: (int) Number of critic networks to create.
     """
 
-    def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        lr_schedule: Callable,
-        net_arch: Optional[List[int]] = None,
-        device: Union[th.device, str] = "auto",
-        activation_fn: Type[nn.Module] = nn.ReLU,
-        features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        n_critics: int = 2,
-    ):
-        super(CnnPolicy, self).__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch,
-            device,
-            activation_fn,
-            features_extractor_class,
-            features_extractor_kwargs,
-            normalize_images,
-            optimizer_class,
-            optimizer_kwargs,
-            n_critics,
-        )
+    def __init__(self, observation_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space,
+                 lr_schedule: Callable,
+                 net_arch: Optional[List[int]] = None,
+                 device: Union[th.device, str] = 'auto',
+                 activation_fn: Type[nn.Module] = nn.ReLU,
+                 features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
+                 features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+                 normalize_images: bool = True,
+                 optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+                 optimizer_kwargs: Optional[Dict[str, Any]] = None,
+                 n_critics: int = 2):
+        super(CnnPolicy, self).__init__(observation_space,
+                                        action_space,
+                                        lr_schedule,
+                                        net_arch,
+                                        device,
+                                        activation_fn,
+                                        features_extractor_class,
+                                        features_extractor_kwargs,
+                                        normalize_images,
+                                        optimizer_class,
+                                        optimizer_kwargs,
+                                        n_critics)
+
+class GnnPolicy(TD3Policy):
+    """
+    Policy class (with both actor and critic) for TD3.
+
+    :param observation_space: (gym.spaces.Space) Observation space
+    :param action_space: (gym.spaces.Space) Action space
+    :param lr_schedule: (Callable) Learning rate schedule (could be constant)
+    :param net_arch: (Optional[List[int]]) The specification of the policy and value networks.
+    :param device: (Union[th.device, str]) Device on which the code should run.
+    :param activation_fn: (Type[nn.Module]) Activation function
+    :param features_extractor_class: (Type[BaseFeaturesExtractor]) Features extractor to use.
+    :param features_extractor_kwargs: (Optional[Dict[str, Any]]) Keyword arguments
+        to pass to the feature extractor.
+    :param normalize_images: (bool) Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: (Type[th.optim.Optimizer]) The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: (Optional[Dict[str, Any]]) Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    :param n_critics: (int) Number of critic networks to create.
+    """
+
+    def __init__(self, observation_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space,
+                 lr_schedule: Callable,
+                 net_arch: Optional[List[int]] = None,
+                 device: Union[th.device, str] = 'auto',
+                 activation_fn: Type[nn.Module] = nn.ReLU,
+                 features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+                 features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+                 normalize_images: bool = True,
+                 optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+                 optimizer_kwargs: Optional[Dict[str, Any]] = None,
+                 n_critics: int = 2, robot_params: List[str]=None):
+        self.robot_params=robot_params
+        super(GnnPolicy, self).__init__(observation_space,
+                                        action_space,
+                                        lr_schedule,
+                                        net_arch,
+                                        device,
+                                        activation_fn,
+                                        features_extractor_class,
+                                        features_extractor_kwargs,
+                                        normalize_images,
+                                        optimizer_class,
+                                        optimizer_kwargs,
+                                        n_critics)
+
+
+    def make_actor(self) -> GNNActor:
+        return GNNActor(robot_params=self.robot_params,**self.net_args).to(self.device)
 
 
 register_policy("MlpPolicy", MlpPolicy)
 register_policy("CnnPolicy", CnnPolicy)
+register_policy("GnnPolicy", GnnPolicy)
