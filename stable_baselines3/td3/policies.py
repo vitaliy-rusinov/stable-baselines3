@@ -117,22 +117,20 @@ class GNNActor(BasePolicy):
         self.robot_graph=graph_plugin.RobotGraphCreator(*robot_params, action_space.shape[0], observation_space.shape[0]).getGraph()
         self.node_feature_num = self.robot_graph.get_num_features_per_joint()
 
-
-
         action_dim = get_action_dim(self.action_space)
 
         net_features_dim=self.robot_graph.get_nonjoint_features_num()+256
-
-        #actor_net = create_mlp(net_features_dim, action_dim, net_arch, activation_fn, squash_output=True)
+        actor_net = create_mlp(net_features_dim, 1, net_arch, activation_fn, squash_output=True)
         # Deterministic action
-        #self.mu = nn.Sequential(*actor_net)
+        self.postproc_mlp = nn.Sequential(*actor_net)
+        self.lin1=th.nn.Linear(self.node_feature_num,256)
+        self.convgru=torch_geometric.nn.GatedGraphConv(out_channels=256, num_layers=5)
+        #self.conv1=torch_geometric.nn.GCNConv(self.node_feature_num, 256)
+        #self.conv2 = torch_geometric.nn.GCNConv(256, 256)
+        #self.conv3 = torch_geometric.nn.GCNConv(256, 256)
+        #self.conv4 = torch_geometric.nn.GCNConv(256, 256)
 
-        self.conv1=torch_geometric.nn.GCNConv(self.node_feature_num, 256)
-        self.conv2 = torch_geometric.nn.GCNConv(256, 256)
-        self.conv3 = torch_geometric.nn.GCNConv(256, 256)
-        self.conv4 = torch_geometric.nn.GCNConv(256, 256)
-
-        self.lin1 = th.nn.Linear(256,1)
+        #self.lin1 = th.nn.Linear(256,1)
 
     def _get_data(self) -> Dict[str, Any]:
         data = super()._get_data()
@@ -150,19 +148,32 @@ class GNNActor(BasePolicy):
         features = self.extract_features(obs)
 
         torch_geom_node_features, torch_geom_edge_index=graph_plugin.initialize_features_2_per_node(self.robot_graph,obs,False)
+        nonjoint_features=self.robot_graph.get_nonjoint_features(obs)
+
         batch_size = obs.shape[0]
 
-        q = self.conv1(torch_geom_node_features, torch_geom_edge_index)
-        q = th.nn.functional.relu(q)
-        q = self.conv2(q, torch_geom_edge_index)
-        q = th.nn.functional.relu(q)
-        q = self.conv3(q, torch_geom_edge_index)
-        q = th.nn.functional.relu(q)
-        q = self.conv4(q, torch_geom_edge_index)
-        q = th.nn.functional.relu(q)
+        #q=self.convgru()
+
+        q=self.lin1(torch_geom_node_features)
+
+        q = self.convgru(q,torch_geom_edge_index)
+
+        #q = self.conv1(torch_geom_node_features, torch_geom_edge_index)
+        #q = th.nn.functional.relu(q)
+        #q = self.conv2(q, torch_geom_edge_index)
+        #q = th.nn.functional.relu(q)
+        #q = self.conv3(q, torch_geom_edge_index)
+        #q = th.nn.functional.relu(q)
+        #q = self.conv4(q, torch_geom_edge_index)
+        #q = th.nn.functional.relu(q)
         gnn_output = q.reshape((batch_size, int(torch_geom_node_features.shape[0]/batch_size),-1))
         gnn_output=gnn_output[:,1:,:]#.mean(-1)
-        output=self.lin1(gnn_output)
+
+
+
+        nonjoint_features_expanded = nonjoint_features.unsqueeze(1).expand(-1, gnn_output.shape[1], -1)
+        concat_features = th.cat([gnn_output, nonjoint_features_expanded], 2)
+        output=self.postproc_mlp(concat_features)
 
         return output.reshape(batch_size,-1)
         #return self.mu(features)
